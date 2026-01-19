@@ -19,6 +19,16 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
 
+/**
+ * @brief Writes 'n' bytes to a descriptor.
+ *
+ * Handles partial writes (common in non-blocking I/O or signals).
+ *
+ * @param fd File descriptor to write to.
+ * @param usrbuf Buffer containing data.
+ * @param n Number of bytes to write.
+ * @return ssize_t Number of bytes written, or -1 on error.
+ */
 static ssize_t writen(int fd, void *usrbuf, size_t n)
 {
     ssize_t nwritten;
@@ -57,6 +67,16 @@ static mime_type_t mime[] = {{".html", "text/html"},
                              {".css", "text/css"},
                              {NULL, "text/plain"}};
 
+/**
+ * @brief Parses the URI to resolve the filename.
+ *
+ * Constructs the full local file path from the web root and the requested URI.
+ * Handles adding "index.html" if the URI ends in a slash.
+ *
+ * @param uri The requested URI.
+ * @param uri_length Length of the URI.
+ * @param filename Buffer to store the resolved filename.
+ */
 static void parse_uri(char *uri, int uri_length, char *filename)
 {
     assert(uri && "parse_uri: uri is NULL");
@@ -98,6 +118,15 @@ static void parse_uri(char *uri, int uri_length, char *filename)
     debug("served filename = %s", filename);
 }
 
+/**
+ * @brief Sends an error response to the client.
+ *
+ * @param fd Client socket.
+ * @param cause The cause of the error.
+ * @param errnum HTTP error code (e.g., "404").
+ * @param shortmsg Short error message.
+ * @param longmsg Detailed error message.
+ */
 static void do_error(int fd,
                      char *cause,
                      char *errnum,
@@ -151,6 +180,18 @@ static const char *get_msg_from_status(int status_code)
     return "Unknown";
 }
 
+/**
+ * @brief Serves a static file to the client.
+ *
+ * Uses mmap to map the file into memory and then writes it to the socket.
+ * This is more efficient than read/write cycle as it reduces user-kernel context switches
+ * and data copying.
+ *
+ * @param fd Client socket.
+ * @param filename Path to the file.
+ * @param filesize Size of the file.
+ * @param out Output metadata (headers).
+ */
 static void serve_static(int fd,
                          char *filename,
                          size_t filesize,
@@ -195,6 +236,10 @@ static void serve_static(int fd,
     int srcfd = open(filename, O_RDONLY, 0);
     assert(srcfd > 2 && "open error");
     /* TODO: use sendfile(2) for zero-copy support */
+    /* mmap maps the file content to a memory address.
+     * PROT_READ: Pages may be read.
+     * MAP_PRIVATE: Create a private copy-on-write mapping.
+     */
     char *srcaddr = mmap(NULL, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0);
     assert(srcaddr != (void *) -1 && "mmap error");
     close(srcfd);
@@ -213,6 +258,14 @@ static inline int init_http_out(http_out_t *o, int fd)
     return 0;
 }
 
+/**
+ * @brief Core request handling logic.
+ *
+ * Called when the client socket is ready to be read (EPOLLIN).
+ * It reads data from the socket, parses the request, and sends a response.
+ *
+ * @param ptr Pointer to http_request_t structure.
+ */
 void do_request(void *ptr)
 {
     http_request_t *r = ptr;
@@ -221,16 +274,19 @@ void do_request(void *ptr)
     char filename[SHORTLINE];
     webroot = r->root;
 
+    /* Remove existing timer while processing the request */
     del_timer(r);
     for (;;) {
+        /* Calculate available space in the ring buffer */
         char *plast = &r->buf[r->last % MAX_BUF];
         size_t remain_size =
             MIN(MAX_BUF - (r->last - r->pos) - 1, MAX_BUF - r->last % MAX_BUF);
 
+        /* Read data from the socket */
         int n = read(fd, plast, remain_size);
         assert(r->last - r->pos < MAX_BUF && "request buffer overflow!");
 
-        if (n == 0) /* EOF */
+        if (n == 0) /* EOF: Client closed connection */
             goto err;
 
         if (n < 0) {
@@ -238,15 +294,17 @@ void do_request(void *ptr)
                 log_err("read err, and errno = %d", errno);
                 goto err;
             }
+            /* EAGAIN: We have read all available data for now.
+             * Break out of the loop and wait for more data (via epoll). */
             break;
         }
 
         r->last += n;
         assert(r->last - r->pos < MAX_BUF && "request buffer overflow!");
 
-        /* about to parse request line */
+        /* Try to parse the request line (GET /path HTTP/1.1) */
         rc = http_parse_request_line(r);
-        if (rc == EAGAIN)
+        if (rc == EAGAIN) /* Incomplete request line, continue reading */
             continue;
         if (rc != 0) {
             log_err("rc != 0");
@@ -256,15 +314,16 @@ void do_request(void *ptr)
         debug("uri = %.*s", (int) (r->uri_end - r->uri_start),
               (char *) r->uri_start);
 
+        /* Try to parse headers */
         rc = http_parse_request_body(r);
-        if (rc == EAGAIN)
+        if (rc == EAGAIN) /* Incomplete headers, continue reading */
             continue;
         if (rc != 0) {
             log_err("rc != 0");
             goto err;
         }
 
-        /* handle http header */
+        /* Handle http header processing and prepare response */
         http_out_t *out = malloc(sizeof(http_out_t));
         if (!out) {
             log_err("no enough space for http_out_t");
@@ -304,12 +363,16 @@ void do_request(void *ptr)
         free(out);
     }
 
+    /* Re-arm the epoll event.
+     * We used EPOLLONESHOT, so we must manually re-enable the event.
+     */
     struct epoll_event event = {
         .data.ptr = ptr,
         .events = EPOLLIN | EPOLLET | EPOLLONESHOT,
     };
     epoll_ctl(r->epfd, EPOLL_CTL_MOD, r->fd, &event);
 
+    /* Reset the timeout timer */
     add_timer(r, TIMEOUT_DEFAULT, http_close_conn);
     return;
 
