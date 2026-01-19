@@ -1,10 +1,36 @@
+/**
+ * http_parser.c - A simple non-blocking HTTP parser.
+ *
+ * This parser uses a Finite State Machine (FSM) to parse HTTP requests.
+ *
+ * Why FSM?
+ * In a non-blocking environment (like epoll), data arrives in chunks. We might
+ * get half of a request line in one read(), and the rest later. A traditional
+ * linear parser would block waiting for the rest, which defeats the purpose of
+ * non-blocking I/O.
+ *
+ * An FSM processes one character at a time and transitions between states.
+ * If we run out of data, we simply return EAGAIN and save the current state.
+ * When more data arrives, we resume exactly where we left off.
+ */
+
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 
 #include "http.h"
 
-/* constant-time string comparison */
+/* Constant-time string comparison macro.
+ *
+ * Instead of comparing char by char, this casts the 4 characters to a uint32_t
+ * and compares them in a single CPU instruction (on supported architectures).
+ *
+ * m: pointer to the string in memory
+ * c0, c1, c2, c3: the characters to compare against (e.g., 'G', 'E', 'T', ' ')
+ *
+ * Note: This relies on little-endian architecture (common on x86/ARM).
+ * (c3 << 24) puts the last char in the most significant byte.
+ */
 #define cst_strcmp(m, c0, c1, c2, c3) \
     *(uint32_t *) m == ((c3 << 24) | (c2 << 16) | (c1 << 8) | c0)
 
@@ -12,6 +38,12 @@
 #define LF '\n'
 #define CRLFCRLF "\r\n\r\n"
 
+/**
+ * @brief Parses the HTTP Request Line (e.g., "GET /index.html HTTP/1.1").
+ *
+ * @param r The request structure containing the buffer and state.
+ * @return int 0 on success, EAGAIN if more data is needed, or error code.
+ */
 int http_parse_request_line(http_request_t *r)
 {
     uint8_t ch, *p, *m;
@@ -35,8 +67,10 @@ int http_parse_request_line(http_request_t *r)
         s_almost_done
     } state;
 
+    /* Resume from saved state */
     state = r->state;
 
+    /* Iterate over the available data in the ring buffer */
     for (pi = r->pos; pi < r->last; pi++) {
         p = (uint8_t *) &r->buf[pi % MAX_BUF];
         ch = *p;
@@ -47,7 +81,7 @@ int http_parse_request_line(http_request_t *r)
         case s_start:
             r->request_start = p;
 
-            if (ch == CR || ch == LF)
+            if (ch == CR || ch == LF) /* Skip empty lines */
                 break;
 
             if ((ch < 'A' || ch > 'Z') && ch != '_')
@@ -57,9 +91,10 @@ int http_parse_request_line(http_request_t *r)
             break;
 
         case s_method:
-            if (ch == ' ') {
+            if (ch == ' ') { /* Space after method */
                 m = r->request_start;
 
+                /* Optimization: Check method length and use fast compare */
                 switch (p - m) {
                 case 3:
                     if (cst_strcmp(m, 'G', 'E', 'T', ' ')) {
@@ -119,7 +154,7 @@ int http_parse_request_line(http_request_t *r)
             }
             break;
 
-        /* space+ after URI */
+        /* space+ after URI. Expecting "HTTP/..." */
         case s_http:
             switch (ch) {
             case ' ':
@@ -250,6 +285,7 @@ int http_parse_request_line(http_request_t *r)
         }
     }
 
+    /* Run out of data, save state and return EAGAIN */
     r->pos = pi;
     r->state = state;
 
@@ -266,6 +302,12 @@ done:
     return 0;
 }
 
+/**
+ * @brief Parses the HTTP Request Headers (Key: Value).
+ *
+ * @param r The request structure.
+ * @return int 0 on success, EAGAIN if more data needed, or error.
+ */
 int http_parse_request_body(http_request_t *r)
 {
     uint8_t ch, *p;

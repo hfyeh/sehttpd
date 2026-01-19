@@ -11,18 +11,24 @@
 
 typedef int (*prio_queue_comparator)(void *pi, void *pj);
 
-/* priority queue with binary heap */
+/**
+ * @brief Priority Queue structure using a binary heap.
+ *
+ * Used to efficiently manage timers. The timer with the smallest expiration time
+ * is always at the root (index 1).
+ */
 typedef struct {
-    void **priv;
-    size_t nalloc;
-    size_t size;
-    prio_queue_comparator comp;
+    void **priv;                /* Array of pointers to items */
+    size_t nalloc;              /* Number of items currently in the queue */
+    size_t size;                /* Total allocated capacity */
+    prio_queue_comparator comp; /* Comparator function */
 } prio_queue_t;
 
 static bool prio_queue_init(prio_queue_t *ptr,
                             prio_queue_comparator comp,
                             size_t size)
 {
+    /* Allocate memory for 'size + 1' items because binary heap uses 1-based indexing */
     ptr->priv = malloc(sizeof(void *) * (size + 1));
     if (!ptr->priv) {
         log_err("prio_queue_init: malloc failed");
@@ -78,6 +84,7 @@ static inline void swap(prio_queue_t *ptr, size_t i, size_t j)
     ptr->priv[j] = tmp;
 }
 
+/* "Swim" (percolate up) operation to restore heap property after insertion */
 static inline void swim(prio_queue_t *ptr, size_t k)
 {
     while (k > 1 && ptr->comp(ptr->priv[k], ptr->priv[k / 2])) {
@@ -86,14 +93,17 @@ static inline void swim(prio_queue_t *ptr, size_t k)
     }
 }
 
+/* "Sink" (percolate down) operation to restore heap property after deletion */
 static size_t sink(prio_queue_t *ptr, size_t k)
 {
     size_t nalloc = ptr->nalloc;
 
     while (2 * k <= nalloc) {
         size_t j = 2 * k;
+        /* Choose the smaller of the two children */
         if (j < nalloc && ptr->comp(ptr->priv[j + 1], ptr->priv[j]))
             j++;
+        /* If parent is already smaller than children, stop */
         if (!ptr->comp(ptr->priv[j], ptr->priv[k]))
             break;
         swap(ptr, j, k);
@@ -109,9 +119,12 @@ static bool prio_queue_delmin(prio_queue_t *ptr)
     if (prio_queue_is_empty(ptr))
         return true;
 
+    /* Move the last item to the root and sink it down */
     swap(ptr, 1, ptr->nalloc);
     ptr->nalloc--;
     sink(ptr, 1);
+
+    /* Shrink the array if it's too empty to save memory */
     if (ptr->nalloc > 0 && ptr->nalloc <= (ptr->size - 1) / 4) {
         if (!resize(ptr, ptr->size / 2))
             return false;
@@ -166,6 +179,9 @@ int find_timer()
         timer_node *node = prio_queue_min(&timer);
         assert(node && "prio_queue_min error");
 
+        /* Lazy deletion handling:
+         * If the timer at the top is marked as deleted, remove it and check the next one.
+         */
         if (node->deleted) {
             bool ret UNUSED = prio_queue_delmin(&timer);
             assert(ret && "prio_queue_delmin");
@@ -198,8 +214,11 @@ void handle_expired_timers()
             continue;
         }
 
+        /* If the earliest timer hasn't expired yet, we are done */
         if (node->key > current_msec)
             return;
+
+        /* Execute the callback (e.g., close the connection) */
         if (node->callback)
             node->callback(node->request);
 
@@ -231,5 +250,6 @@ void del_timer(http_request_t *req)
     timer_node *node = req->timer;
     assert(node && "del_timer: req->timer is NULL");
 
+    /* Lazy deletion: Just mark it. It will be removed later. */
     node->deleted = true;
 }
